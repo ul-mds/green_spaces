@@ -18,6 +18,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import statsmodels.formula.api as smf
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.stattools import durbin_watson
+from scipy import stats as scipy_stats
 
 __all__ = [
     "fit_model",
@@ -25,6 +29,7 @@ __all__ = [
     "plot_forest",
     "fit_stratified",
     "fit_interaction",
+    "check_residuals",
 ]
 
 
@@ -38,7 +43,8 @@ def fit_model(
     predictor_type="categorical",
     reference_category=None,
     covariates=None,
-    scale_predictor=None
+    scale_predictor=None,
+    cov_type="HC3"
 ):
     """
     Fit an OLS linear regression model.
@@ -82,6 +88,17 @@ def fit_model(
             scale_predictor=0.1 → coefficient is effect per
             0.1-unit increase in NDVI.
 
+    cov_type : str, default="HC3"
+        Covariance estimator passed to statsmodels .fit(cov_type=...).
+        "HC3" gives heteroskedasticity-robust standard errors (recommended
+        default — robust to non-constant residual variance across
+        predictor/covariate levels, at negligible cost when errors are in
+        fact homoskedastic). Set to "nonrobust" for classical OLS standard
+        errors (assumes homoskedasticity), or another statsmodels-supported
+        type ("HC0", "HC1", "HC2", "HAC", "cluster", ...).
+        Note: Changing cov_type affects only SE, CI, and p-values — 
+        point estimates (beta) are identical regardless of cov_type.
+
     Returns
     -------
     result : RegressionResultsWrapper
@@ -96,6 +113,7 @@ def fit_model(
         - covariates        : list[str]
         - scale_predictor   : float or None
         - predictor_levels  : list or None (categorical only)
+        - cov_type          : str — covariance estimator used
     """
 
     if covariates is None:
@@ -173,7 +191,7 @@ def fit_model(
     # Fit model
     # --------------------------------------------------
     model  = smf.ols(formula, data=working_df)
-    result = model.fit()
+    result = model.fit(cov_type=cov_type)
 
     metadata = {
         "n":                  len(working_df),
@@ -183,7 +201,8 @@ def fit_model(
         "reference_category": reference_category,
         "covariates":         covariates,
         "predictor_levels":   predictor_levels,
-        "scale_predictor":    scale_predictor
+        "scale_predictor":    scale_predictor,
+        "cov_type":           cov_type
     }
 
     return result, metadata
@@ -310,11 +329,12 @@ def extract_results(
     )
 
     # --------------------------------------------------
-    # Covariates used
+    # Covariates used and SE estimator (for methods reporting)
     # --------------------------------------------------
     results["covariates"] = (
         ", ".join(metadata["covariates"]) if metadata.get("covariates") else "unadjusted"
     )
+    results["cov_type"] = metadata.get("cov_type", "nonrobust")
 
     # --------------------------------------------------
     # Round numeric columns
@@ -339,6 +359,7 @@ def extract_results(
         "p_value",
         "p_value_fmt",
         "covariates",
+        "cov_type",
     ]]
 
 
@@ -349,7 +370,7 @@ def plot_forest(
     results_df,
     title=None,
     xlabel="Coefficient (95% CI)",
-    ylabel="Green Exposure",
+    ylabel="Predictor",
     figsize=(6, 3),
     dpi=300,
     predictor_type=None,
@@ -371,7 +392,7 @@ def plot_forest(
 
     xlabel : str, default="Coefficient (95% CI)"
 
-    ylabel : str, default="Green Exposure"
+    ylabel : str, default="Predictor"
 
     figsize : tuple, default=(6, 3)
 
@@ -507,60 +528,65 @@ def fit_stratified(
     reference_category=None,
     covariates=None,
     scale_predictor=None,
-    min_group_n=30
+    min_group_n=30,
+    cov_type="HC3"
 ):
     """
     Fit separate OLS linear regression models within each stratum of a
     grouping variable to assess effect modification (interaction).
- 
+
     Use this to answer: "Is the association between green exposure and
     mental health score stronger or weaker for people with low SES?"
- 
+
     Each stratum receives its own model. Comparing coefficients across
     strata reveals whether the exposure–outcome association is more
     pronounced in specific subgroups.
- 
+
     For a formal statistical test of interaction, use fit_interaction().
- 
+
     Parameters
     ----------
     data : pd.DataFrame
- 
+
     outcome : str
         Continuous numeric outcome (e.g. "CES-D Score").
- 
+
     predictor : str
         Exposure variable (e.g. "Green Space Quartile (100m Buffer)").
- 
+
     stratify_by : str
         Grouping variable defining the strata.
         Example: "Socioeconomic Status (Tiers)"
             0 = low SES, 1 = mid SES, 2 = high SES
- 
+
     strata : list, optional
         Specific stratum values to include.
         If None, all unique values of stratify_by are used.
         Example: [0, 1, 2]
- 
+
     predictor_type : str, default="categorical"
         Passed to fit_model().
- 
+
     reference_category : str, optional
         Passed to fit_model().
- 
+
     covariates : list[str], optional
         Adjustment variables other than stratify_by.
         stratify_by is never included as a covariate in stratified
         models — the data is already split by it.
- 
+
     scale_predictor : float, optional
         Passed to fit_model() for continuous predictors.
- 
+
     min_group_n : int, default=30
         Minimum sample size required within a stratum to fit a model.
         Strata with fewer observations are skipped with a message
         rather than raising an error.
- 
+
+    cov_type : str, default="HC3"
+        Covariance estimator passed to fit_model() for every stratum.
+        See fit_model()'s docstring for details.
+
     Returns
     -------
     results : dict
@@ -569,42 +595,42 @@ def fit_stratified(
             - "metadata"  : dict  (includes stratum info)
             - "beta_table": pd.DataFrame from extract_results()
             - "n"         : int
- 
+
     summary : pd.DataFrame
         Coefficient tables from all strata stacked, with a "stratum"
         column added. Ready for comparison or plotting.
     """
- 
+
     subset_data = data.dropna(subset=[stratify_by])
- 
+
     if strata is None:
         try:
             strata = sorted(subset_data[stratify_by].unique())
         except TypeError:
             strata = list(subset_data[stratify_by].unique())
- 
+
     # Ensure stratify_by is not also in covariates
     covariates = list(covariates) if covariates else []
     if stratify_by in covariates:
         covariates = [c for c in covariates if c != stratify_by]
- 
+
     results     = {}
     beta_tables = []
- 
+
     for stratum in strata:
- 
+
         stratum_df = subset_data[subset_data[stratify_by] == stratum].copy()
- 
+
         n_stratum = len(stratum_df)
         print(f"  Stratum {stratify_by} = {stratum}  (n = {n_stratum})")
- 
+
         if n_stratum < min_group_n:
             print(
                 f"    [skip] n={n_stratum} is below min_group_n={min_group_n} "
                 "— insufficient data to fit model."
             )
             continue
- 
+
         try:
             result, metadata = fit_model(
                 data               = stratum_df,
@@ -613,36 +639,37 @@ def fit_stratified(
                 predictor_type     = predictor_type,
                 reference_category = reference_category,
                 covariates         = covariates,
-                scale_predictor    = scale_predictor
+                scale_predictor    = scale_predictor,
+                cov_type           = cov_type
             )
- 
+
             # Add stratum info to metadata
             metadata["stratum_var"]   = stratify_by
             metadata["stratum_value"] = stratum
- 
+
             beta_table = extract_results(result, metadata)
             beta_table.insert(0, "stratum", stratum)
- 
+
             results[stratum] = {
                 "result":     result,
                 "metadata":   metadata,
                 "beta_table": beta_table,
                 "n":          metadata["n"]
             }
- 
+
             beta_tables.append(beta_table)
- 
+
         except Exception as e:
             print(f"    [error] stratum {stratum}: {e}")
- 
+
     summary = (
         pd.concat(beta_tables, axis=0, ignore_index=True)
         if beta_tables else pd.DataFrame()
     )
- 
+
     return results, summary
- 
- 
+
+
 ############################################################
 ## Interaction Term (Effect Modification)
 ############################################################
@@ -658,29 +685,30 @@ def fit_interaction(
     reference_category=None,
     label_mapping=None,
     covariates=None,
+    cov_type="HC3"
 ):
     """
     Fit an OLS linear regression model with a predictor × moderator
     interaction term to formally test effect modification.
- 
+
     Use this to answer: "Does SES statistically modify the association
     between green exposure and mental health score?"
- 
+
     A significant interaction p-value means the exposure–outcome
     association differs across moderator levels — i.e. effect
     modification is present. Pair this with fit_stratified() to
     visualize the direction and magnitude in each stratum.
- 
+
     Parameters
     ----------
     data : pd.DataFrame
- 
+
     outcome : str
         Continuous numeric outcome (e.g. "CES-D Score").
- 
+
     predictor : str
         Primary exposure (e.g. "Green Space Quartile (500m Buffer)").
- 
+
     moderator : str
         Effect modifier to test (e.g. "Socioeconomic Status (Tiers)").
 
@@ -688,55 +716,59 @@ def fit_interaction(
         "categorical" or "continuous".
         For ordinal moderators like SES (1/2/3), "categorical" uses
         dummy coding; "continuous" assumes a linear moderating effect.
- 
+
     moderator_reference : str/int, optional
         Reference level for a categorical moderator.
-        Example: 0 (low SES as reference).
- 
+        Example: 1 (low SES as reference).
+
     predictor_type : str, default="categorical"
         "categorical" or "continuous".
 
     scale_predictor : float, optional
         Scale factor for continuous predictor (e.g. 0.1 for NDVI).
- 
+
     reference_category : str, optional
         Reference level for a categorical predictor.
 
-     label_mapping : dict, optional
+    label_mapping : dict, optional
         Maps raw coefficient labels to display labels.
         Default (quartiles):
             {"1.0": "Q1", "2.0": "Q2", "3.0": "Q3", "4.0": "Q4"}
- 
+
     covariates : list[str], optional
         Additional adjustment variables (not interacted).
- 
+
+    cov_type : str, default="HC3"
+        Covariance estimator passed to statsmodels .fit(cov_type=...).
+        Matches fit_model()'s default — see its docstring for details.
+
     Returns
     -------
     result : RegressionResultsWrapper
         Fitted model with interaction term.
- 
+
     metadata : dict
         Standard metadata plus:
             - "moderator"           : str
             - "moderator_type"      : str
             - "moderator_reference" : str or None
             - "formula"             : str — full patsy formula used
- 
+
     interaction_table : pd.DataFrame
         Coefficients, CIs, and p-values for the interaction terms only
         — the key output for assessing effect modification.
 
-         Columns:
+        Columns:
             outcome, predictor, predictor_type, moderator, scale_predictor,
             reference_level, level, moderator_level,
             beta, SE, CI_lower, CI_upper, beta_95CI,
             p_value, p_value_fmt, covariates, significant
- 
+
         `level` and `moderator_level` together identify each row: with
         a categorical moderator that has more than two levels (e.g.
         SES tiers 1 and 2 both vs reference 0), `level` alone repeats
         across rows — `moderator_level` distinguishes them.
- 
+
     Notes
     -----
     Interpretation of interaction terms:
@@ -744,30 +776,30 @@ def fit_interaction(
             Each interaction coefficient is the *additional* change
             in outcome for that predictor level in that moderator
             group, relative to the reference group.
- 
+
         Continuous predictor × categorical moderator:
             The interaction coefficient is the *additional* slope
             per unit of predictor for that moderator group.
- 
+
     A significant interaction p-value (< 0.05) supports effect
     modification. Use fit_stratified() alongside this to inspect
     stratum-specific coefficients.
     """
- 
+
     covariates = list(covariates) if covariates else []
- 
+
     # Exclude moderator from covariates — it enters via interaction
     covariates = [c for c in covariates if c != moderator]
- 
+
     model_cols = [outcome, predictor, moderator] + covariates
     subset     = data[model_cols].dropna().copy()
- 
+
     if subset.empty:
         raise ValueError(
             f"No complete cases for outcome='{outcome}', "
             f"predictor='{predictor}', moderator='{moderator}'."
         )
- 
+
     # --------------------------------------------------
     # Predictor
     # --------------------------------------------------
@@ -783,7 +815,7 @@ def fit_interaction(
             reference_category = predictor_levels[0]
         else:
             reference_category = str(reference_category)
- 
+
     elif predictor_type == "continuous":
         subset[predictor] = pd.to_numeric(subset[predictor], errors="coerce")
         subset            = subset.dropna(subset=[predictor])
@@ -793,7 +825,7 @@ def fit_interaction(
             subset[predictor] = subset[predictor] / scale_predictor
     else:
         raise ValueError("predictor_type must be 'categorical' or 'continuous'.")
- 
+
     # --------------------------------------------------
     # Moderator
     # --------------------------------------------------
@@ -813,7 +845,7 @@ def fit_interaction(
         subset[moderator] = pd.to_numeric(subset[moderator], errors="coerce")
         subset            = subset.dropna(subset=[moderator])
         mod_levels        = None
- 
+
     # --------------------------------------------------
     # Rename for formula
     # --------------------------------------------------
@@ -823,7 +855,7 @@ def fit_interaction(
         moderator: "moderator_z"
     }
     working_df = subset.rename(columns=rename_dict)
- 
+
     # --------------------------------------------------
     # Build formula with interaction
     # --------------------------------------------------
@@ -832,26 +864,26 @@ def fit_interaction(
         pred_term = f'C(predictor_x, Treatment(reference="{ref}"))'
     else:
         pred_term = "predictor_x"
- 
+
     if moderator_type == "categorical":
         mod_ref  = str(moderator_reference).replace('"', '\\"')
         mod_term = f'C(moderator_z, Treatment(reference="{mod_ref}"))'
     else:
         mod_term = "moderator_z"
- 
+
     # Main effects + interaction
     formula = f"outcome_y ~ {pred_term} + {mod_term} + {pred_term}:{mod_term}"
- 
+
     if covariates:
         covariate_terms = " + ".join(f'Q("{c}")' for c in covariates)
         formula += " + " + covariate_terms
- 
+
     # --------------------------------------------------
     # Fit model
     # --------------------------------------------------
     model  = smf.ols(formula, data=working_df)
-    result = model.fit()
- 
+    result = model.fit(cov_type=cov_type)
+
     # --------------------------------------------------
     # Extract interaction terms only
     # --------------------------------------------------
@@ -859,15 +891,15 @@ def fit_interaction(
     conf_int = result.conf_int()
     pvals    = result.pvalues
     ses      = result.bse
- 
+
     interaction_mask = params.index.str.contains(
         "predictor_x.*moderator_z|moderator_z.*predictor_x", regex=True
     )
- 
+
     if not interaction_mask.any():
         # Fallback: any term containing ":"
         interaction_mask = params.index.str.contains(":", regex=False)
- 
+
     betas    = params.loc[interaction_mask]
     lower_ci = conf_int.loc[interaction_mask, 0]
     upper_ci = conf_int.loc[interaction_mask, 1]
@@ -880,7 +912,7 @@ def fit_interaction(
         "SE":          se_vals.values.round(3),
         "CI_lower":    lower_ci.values.round(3),
         "CI_upper":    upper_ci.values.round(3),
-        "beta_95CI":       [
+        "beta_95CI":   [
             f"{b:.3f} ({l:.3f}, {u:.3f})"
             for b, l, u in zip(betas.values, lower_ci.values, upper_ci.values)
         ],
@@ -890,7 +922,7 @@ def fit_interaction(
         ],
         "significant": p_values.values < 0.05
     })
- 
+
     # --------------------------------------------------
     # Clean coefficient labels and set reference_level
     # Categorical: predictor_x[T.2.0]:moderator_z[T.1] → Q2
@@ -931,7 +963,7 @@ def fit_interaction(
         )
     else:
         interaction_table["moderator_level"] = moderator
-    
+
     metadata = {
         "n":                   len(working_df),
         "outcome":             outcome,
@@ -944,6 +976,7 @@ def fit_interaction(
         "moderator_reference": moderator_reference,
         "scale_predictor":     scale_predictor,
         "covariates":          covariates,
+        "cov_type":            cov_type,
         "formula":             formula
     }
 
@@ -956,6 +989,7 @@ def fit_interaction(
     interaction_table["covariates"] = (
         ", ".join(covariates) if covariates else "unadjusted"
     )
+    interaction_table["cov_type"] = cov_type
 
     interaction_table = interaction_table[[
         "outcome",
@@ -974,14 +1008,170 @@ def fit_interaction(
         "p_value",
         "p_value_fmt",
         "covariates",
+        "cov_type",
         "significant",
     ]]
-    
+
     n_sig = interaction_table["significant"].sum()
     print(
         f"  Interaction fitted | n = {len(working_df)} | "
         f"{n_sig}/{len(interaction_table)} interaction terms p < 0.05"
     )
- 
+
     return result, metadata, interaction_table
 
+
+############################################################
+## Residual Diagnostics
+############################################################
+def check_residuals(
+    result,
+    metadata=None,
+    alpha=0.05,
+    figsize=(12, 4),
+    dpi=300,
+    save_path=None
+):
+    """
+    Diagnostic checks for OLS linear regression residuals.
+
+    Reports:
+        1) Breusch-Pagan test for heteroskedasticity
+           (motivates the choice of a robust covariance estimator,
+           e.g. cov_type="HC3" in fit_model())
+        2) Shapiro-Wilk test for residual normality
+        3) Durbin-Watson statistic for autocorrelation of residuals
+           in the order the data was fitted (NOT a spatial test —
+           see Notes)
+        4) Residuals-vs-fitted plot (detects non-linearity, heteroskedasticity)
+        5) Q-Q plot of residuals (detects non-normality)
+
+    Parameters
+    ----------
+    result : RegressionResultsWrapper
+        Fitted OLS result from fit_model().
+
+    metadata : dict, optional
+        If provided, used to label the diagnostic plot title with the
+        outcome and predictor names.
+
+    alpha : float, default=0.05
+        Significance threshold for the Breusch-Pagan and Shapiro-Wilk
+        verdicts.
+
+    figsize : tuple, default=(12, 4)
+
+    dpi : int, default=300
+
+    save_path : str, optional
+        If provided, save the diagnostic figure to this path as PNG.
+
+    Returns
+    -------
+    dict
+        - breusch_pagan  : dict — {"statistic", "p_value", "heteroskedastic"}
+        - shapiro        : dict — {"statistic", "p_value", "normal"}
+        - durbin_watson  : float — ~2.0 indicates no autocorrelation;
+                           <1.5 or >2.5 suggests positive/negative
+                           autocorrelation in fit order
+        - fig            : matplotlib.figure.Figure
+
+    Notes
+    -----
+    Durbin-Watson tests autocorrelation in the ORDER the data appears in
+    the design matrix (e.g. time order, or arbitrary row order) — it is
+    NOT a test of spatial autocorrelation. To assess whether residuals
+    are spatially clustered (e.g. neighbouring participants having
+    correlated residuals), compute Moran's I on the residuals joined to
+    participant coordinates, using a spatial weights matrix (e.g. via
+    `libpysal`/`esda`). This requires participant-level geometry and is
+    not implemented here — flag as a limitation if not performed, or
+    add a separate spatial-diagnostics utility if coordinates are
+    available.
+    """
+
+    resid  = result.resid
+    fitted = result.fittedvalues
+    exog   = result.model.exog
+
+    # --------------------------------------------------
+    # 1. Breusch-Pagan test for heteroskedasticity
+    # --------------------------------------------------
+    bp_stat, bp_p, _, _ = het_breuschpagan(resid, exog)
+    breusch_pagan = {
+        "statistic":       round(bp_stat, 4),
+        "p_value":         round(bp_p, 4),
+        "heteroskedastic": bp_p < alpha
+    }
+
+    # --------------------------------------------------
+    # 2. Shapiro-Wilk test for residual normality
+    # --------------------------------------------------
+    # Shapiro-Wilk is unreliable for very large n; subsample if needed
+    resid_for_test = (
+        resid if len(resid) <= 5000
+        else resid.sample(5000, random_state=0)
+    )
+    sw_stat, sw_p = scipy_stats.shapiro(resid_for_test)
+    shapiro = {
+        "statistic": round(sw_stat, 4),
+        "p_value":   round(sw_p, 4),
+        "normal":    sw_p >= alpha
+    }
+
+    # --------------------------------------------------
+    # 3. Durbin-Watson (fit-order autocorrelation, NOT spatial)
+    # --------------------------------------------------
+    dw_stat = round(durbin_watson(resid), 4)
+
+    # --------------------------------------------------
+    # 4-5. Diagnostic plots
+    # --------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=figsize, dpi=dpi)
+
+    axes[0].scatter(fitted, resid, alpha=0.4, s=12, edgecolor="none")
+    axes[0].axhline(0, color="tab:red", linestyle="--", linewidth=1.5)
+    axes[0].set_xlabel("Fitted values")
+    axes[0].set_ylabel("Residuals")
+    axes[0].set_title("Residuals vs Fitted")
+    axes[0].spines["top"].set_visible(False)
+    axes[0].spines["right"].set_visible(False)
+
+    sm.qqplot(resid, line="s", ax=axes[1])
+    axes[1].set_title("Normal Q-Q")
+    axes[1].spines["top"].set_visible(False)
+    axes[1].spines["right"].set_visible(False)
+
+    if metadata:
+        fig.suptitle(
+            f"Residual diagnostics: {metadata.get('outcome', '')} ~ "
+            f"{metadata.get('predictor', '')}",
+            fontweight="bold"
+        )
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight", format="png")
+        print(f"Figure saved to: {save_path}")
+
+    plt.show()
+
+    print(
+        f"  Breusch-Pagan: stat={breusch_pagan['statistic']}, "
+        f"p={breusch_pagan['p_value']} "
+        f"({'heteroskedastic' if breusch_pagan['heteroskedastic'] else 'homoskedastic'})"
+    )
+    print(
+        f"  Shapiro-Wilk:  stat={shapiro['statistic']}, "
+        f"p={shapiro['p_value']} "
+        f"({'non-normal' if not shapiro['normal'] else 'normal'} residuals)"
+    )
+    print(f"  Durbin-Watson: {dw_stat} (fit-order autocorrelation; ~2.0 = none)")
+
+    return {
+        "breusch_pagan": breusch_pagan,
+        "shapiro":       shapiro,
+        "durbin_watson": dw_stat,
+        "fig":           fig
+    }

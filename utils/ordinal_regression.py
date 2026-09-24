@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from statsmodels.miscmodels.ordinal_model import OrderedModel
+import statsmodels.formula.api as smf
 
 __all__ = [
     "fit_model",
@@ -23,6 +24,7 @@ __all__ = [
     "plot_profile",
     "fit_stratified",
     "fit_interaction",
+    "check_proportional_odds",
 ]
 
 
@@ -38,7 +40,8 @@ def fit_model(
     covariates=None,
     distribution="logit",
     method="bfgs",
-    scale_predictor=None
+    scale_predictor=None,
+    cov_type="HC3"
 ):
     """
     Fit a proportional-odds ordinal regression model.
@@ -84,6 +87,17 @@ def fit_model(
             scale_predictor=0.1 → OR is interpretable as effect per
             0.1-unit increase in NDVI.
 
+    cov_type : str, default="HC3"
+        Covariance estimator passed to statsmodels .fit(cov_type=...).
+        "HC3" gives heteroskedasticity-robust standard errors (recommended
+        default). Set to "nonrobust" for the classical MLE (inverse-Hessian)
+        standard errors, or another statsmodels-supported type ("HC0",
+        "HC1", "HC2", ...). 
+        Note: Changing cov_type affects only SE, CI, and p-values — 
+        point estimates (beta/OR) are identical regardless of cov_type. 
+        Confirmed empirically: OrderedModel.fit() accepts cov_type via 
+        the shared statsmodels robust-covariance machinery.
+
     Returns
     -------
     result : OrderedResults
@@ -100,6 +114,7 @@ def fit_model(
         - predictor_levels  : list or None — sorted levels (categorical only)
         - distribution      : str
         - scale_predictor   : float or None
+        - cov_type          : str — covariance estimator used
     """
 
     if covariates is None:
@@ -194,7 +209,7 @@ def fit_model(
         distr=distribution
     )
 
-    result = model.fit(method=method, disp=False)
+    result = model.fit(method=method, disp=False, cov_type=cov_type)
 
     metadata = {
         "n":                  len(working_df),
@@ -206,7 +221,8 @@ def fit_model(
         "outcome_levels":     outcome_levels,
         "predictor_levels":   predictor_levels,
         "distribution":       distribution,
-        "scale_predictor":    scale_predictor
+        "scale_predictor":    scale_predictor,
+        "cov_type":           cov_type
     }
 
     return result, metadata
@@ -353,8 +369,7 @@ def extract_results(
         )
         results["level"]           = raw_labels.map(lambda x: label_mapping.get(x, x))
         results["reference_level"] = label_mapping.get(
-            str(metadata["reference_category"]),
-            str(metadata["reference_category"])
+            str(metadata["reference_category"]), str(metadata["reference_category"])
         )
     else:
         # For continuous variables, use the feature name
@@ -435,6 +450,7 @@ def extract_results(
     results["covariates"] = (
         ", ".join(metadata["covariates"]) if metadata.get("covariates") else "unadjusted"
     )
+    results["cov_type"] = metadata.get("cov_type", "nonrobust")
 
     return results[[
         "reference_level",
@@ -449,6 +465,7 @@ def extract_results(
         "pct_change_odds",
         "interpretation",
         "covariates",
+        "cov_type",
     ]]
 
 
@@ -865,7 +882,8 @@ def fit_stratified(
     distribution="logit",
     method="bfgs",
     scale_predictor=None,
-    min_group_n=30
+    min_group_n=30,
+    cov_type="HC3"
 ):
     """
     Fit separate ordinal regression models within each stratum of a
@@ -888,12 +906,12 @@ def fit_stratified(
         Ordinal mental-health outcome (e.g. "CES-D Ordinal").
  
     predictor : str
-        Exposure variable (e.g. "Green Space Quartile (100m Buffer)").
+        Exposure variable (e.g. "Green Space Quartile (500m Buffer)").
  
     stratify_by : str
         Grouping variable defining the strata.
         Example: "Socioeconomic Status (Tiers)"
-            0 = low SES, 1 = mid SES, 2 = high SES
+            1 = low SES, 2 = mid SES, 3 = high SES
  
     strata : list, optional
         Specific stratum values to include.
@@ -922,6 +940,10 @@ def fit_stratified(
         Minimum sample size required within a stratum to fit a model.
         Strata with fewer observations are skipped with a message
         rather than raising an error.
+ 
+    cov_type : str, default="HC3"
+        Covariance estimator passed to fit_model() for every stratum.
+        See fit_model()'s docstring for details.
  
     Returns
     -------
@@ -977,7 +999,8 @@ def fit_stratified(
                 covariates         = covariates,
                 distribution       = distribution,
                 method             = method,
-                scale_predictor    = scale_predictor
+                scale_predictor    = scale_predictor,
+                cov_type           = cov_type
             )
  
             # Add stratum info to metadata
@@ -1023,7 +1046,8 @@ def fit_interaction(
     distribution="logit",
     method="bfgs",
     scale_predictor=None,
-    label_mapping=None
+    label_mapping=None,
+    cov_type="HC3"
 ):
     """
     Fit an ordinal regression model with a predictor × moderator
@@ -1058,7 +1082,7 @@ def fit_interaction(
  
     moderator_type : str, default="categorical"
         "categorical" or "continuous".
-        For ordinal moderators like SES (0/1/2), "categorical" uses
+        For ordinal moderators like SES (1/2/3), "categorical" uses
         dummy coding; "continuous" assumes a linear moderating effect.
  
     moderator_reference : str/int, optional
@@ -1074,7 +1098,11 @@ def fit_interaction(
  
     scale_predictor : float, optional
         Scale factor for continuous predictor (e.g. 0.1 for NDVI).
- 
+
+    cov_type : str, default="HC3"
+        Covariance estimator passed to statsmodels .fit(cov_type=...).
+        Matches fit_model()'s default — see its docstring for details.
+
     Returns
     -------
     result : OrderedResults
@@ -1218,7 +1246,7 @@ def fit_interaction(
     # Fit Model
     # --------------------------------------------------
     model  = OrderedModel.from_formula(formula, data=working_df, distr=distribution)
-    result = model.fit(method=method, disp=False)
+    result = model.fit(method=method, disp=False, cov_type=cov_type)
  
     # --------------------------------------------------
     # Extract interaction terms only
@@ -1304,7 +1332,7 @@ def fit_interaction(
         )
     else:
         interaction_table["moderator_level"] = moderator
- 
+
     metadata = {
         "n":                   len(working_df),
         "outcome":             outcome,
@@ -1319,18 +1347,20 @@ def fit_interaction(
         "outcome_levels":      outcome_levels,
         "distribution":        distribution,
         "scale_predictor":     scale_predictor,
+        "cov_type":            cov_type,
         "formula":             formula
     }
- 
+
     interaction_table["outcome"]         = outcome
     interaction_table["predictor"]       = predictor
     interaction_table["predictor_type"]  = predictor_type
     interaction_table["moderator"]       = moderator
     interaction_table["scale_predictor"] = scale_predictor
-    
+
     interaction_table["covariates"] = (
         ", ".join(covariates) if covariates else "unadjusted"
     )
+    interaction_table["cov_type"] = cov_type
 
     interaction_table = interaction_table[[
         "outcome",
@@ -1350,6 +1380,7 @@ def fit_interaction(
         "p_value_fmt",
         "pct_change_odds",
         "covariates",
+        "cov_type",
         "significant",
     ]]
 
@@ -1360,4 +1391,215 @@ def fit_interaction(
     )
 
     return result, metadata, interaction_table
+ 
 
+############################################################
+## Proportional-Odds Assumption Check
+############################################################
+def check_proportional_odds(
+    data,
+    outcome,
+    predictor,
+    predictor_type="categorical",
+    reference_category=None,
+    covariates=None,
+    scale_predictor=None,
+    round_digits=3,
+    cov_type="HC3"
+):
+    """
+    Check the proportional-odds (parallel-lines) assumption underlying
+    fit_model()'s ordinal logistic regression.
+
+    Approach
+    --------
+    statsmodels' OrderedModel has no built-in Brant test. This function
+    implements the standard practical alternative: for an outcome with
+    K ordered categories, K-1 binary logistic regressions are fit, each
+    dichotomizing the outcome at a successive cutpoint
+    (y > cutpoint_k vs. y <= cutpoint_k). Under proportional odds, the
+    predictor's coefficient should be approximately constant across all
+    K-1 cutpoint models. Large or systematic differences in the
+    coefficient (or non-overlapping confidence intervals) across
+    cutpoints indicate a violation of the assumption.
+
+    This is a diagnostic, not a single omnibus significance test like
+    the formal Brant chi-square test — report the per-cutpoint estimates
+    and note qualitatively whether they are consistent.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+
+    outcome : str
+        Same ordinal outcome passed to fit_model().
+
+    predictor : str
+        Same exposure variable passed to fit_model().
+
+    predictor_type : str, default="categorical"
+        Should match the predictor_type used in the main fit_model() call.
+
+    reference_category : str, optional
+        Should match the reference_category used in the main model.
+
+    covariates : list[str], optional
+        Should match the covariates used in the main model.
+
+    scale_predictor : float, optional
+        Should match scale_predictor used in the main model.
+
+    round_digits : int, default=3
+
+    cov_type : str, default="HC3"
+        Covariance estimator applied to each per-cutpoint binary logit.
+        Should generally match the cov_type used for the main fit_model()
+        call for a fair comparison.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (cutpoint, predictor level) combination, with columns:
+            cutpoint      : str  — the dichotomization point, e.g. "y > 0"
+            level         : str  — predictor level (categorical) or
+                                    predictor name (continuous)
+            beta          : float — coefficient from the binary logit
+                                    at this cutpoint
+            OR            : float
+            CI_lower      : float
+            CI_upper      : float
+            p_value       : float
+            cov_type      : str  — covariance estimator used
+
+    Notes
+    -----
+    Interpretation: plot or tabulate `beta`/`OR` by `cutpoint` for each
+    predictor level. Roughly constant estimates across cutpoints support
+    the proportional-odds assumption; a clear trend or non-overlapping
+    CIs across cutpoints suggests the assumption is violated for that
+    predictor level, and a partial-proportional-odds or multinomial
+    model may be more appropriate.
+    """
+
+    covariates = list(covariates) if covariates else []
+
+    model_cols = [outcome, predictor] + covariates
+    subset     = data[model_cols].dropna().copy()
+
+    if subset.empty:
+        raise ValueError(
+            f"No complete cases for outcome='{outcome}', predictor='{predictor}'."
+        )
+
+    # --------------------------------------------------
+    # Outcome levels and cutpoints
+    # --------------------------------------------------
+    subset[outcome] = pd.Categorical(subset[outcome], ordered=True)
+    outcome_levels  = list(subset[outcome].cat.categories)
+
+    if len(outcome_levels) < 3:
+        raise ValueError(
+            "Proportional-odds check requires at least three ordered "
+            "outcome levels (same requirement as fit_model())."
+        )
+
+    # K-1 cutpoints: y > level_0, y > level_1, ..., y > level_(K-2)
+    cutpoints = outcome_levels[:-1]
+
+    # --------------------------------------------------
+    # Predictor preparation (mirrors fit_model)
+    # --------------------------------------------------
+    if predictor_type == "categorical":
+        subset[predictor] = subset[predictor].astype(str)
+        raw_levels = subset[predictor].unique()
+        try:
+            predictor_levels = sorted(raw_levels, key=lambda v: float(v))
+        except ValueError:
+            predictor_levels = sorted(raw_levels)
+
+        if reference_category is None:
+            reference_category = predictor_levels[0]
+        else:
+            reference_category = str(reference_category)
+
+    elif predictor_type == "continuous":
+        subset[predictor] = pd.to_numeric(subset[predictor], errors="coerce")
+        subset            = subset.dropna(subset=[predictor])
+        if scale_predictor is not None:
+            subset[predictor] = subset[predictor] / scale_predictor
+    else:
+        raise ValueError("predictor_type must be 'categorical' or 'continuous'.")
+
+    rename_dict = {predictor: "predictor_x"}
+    subset      = subset.rename(columns=rename_dict)
+
+    if predictor_type == "categorical":
+        ref = reference_category.replace('"', '\\"')
+        pred_term = f'C(predictor_x, Treatment(reference="{ref}"))'
+    else:
+        pred_term = "predictor_x"
+
+    formula_rhs = pred_term
+    if covariates:
+        formula_rhs += " + " + " + ".join(f'Q("{c}")' for c in covariates)
+
+    # --------------------------------------------------
+    # Fit one binary logit per cutpoint
+    # --------------------------------------------------
+    records = []
+
+    for cutpoint in cutpoints:
+
+        binary_outcome = (subset[outcome] > cutpoint).astype(int)
+        working_df     = subset.copy()
+        working_df["binary_y"] = binary_outcome
+
+        formula = f"binary_y ~ {formula_rhs}"
+
+        try:
+            binary_result = smf.logit(formula, data=working_df).fit(disp=False, cov_type=cov_type)
+        except Exception as e:
+            print(f"  [warn] cutpoint '{cutpoint}': model failed — {e}")
+            continue
+
+        params   = binary_result.params
+        conf_int = binary_result.conf_int()
+        pvals    = binary_result.pvalues
+
+        coef_mask = params.index.str.contains("predictor_x", regex=False)
+
+        betas    = params.loc[coef_mask]
+        lower_ci = conf_int.loc[coef_mask, 0]
+        upper_ci = conf_int.loc[coef_mask, 1]
+        pv       = pvals.loc[coef_mask]
+
+        if predictor_type == "categorical":
+            labels = (
+                betas.index.str.split("T.").str[-1]
+                .str.replace("]", "", regex=False)
+            )
+        else:
+            labels = [predictor] * len(betas)
+
+        for label, beta, lo, hi, p in zip(labels, betas.values, lower_ci.values, upper_ci.values, pv.values):
+            records.append({
+                "cutpoint": f"y > {cutpoint}",
+                "level":    label,
+                "beta":     round(beta, round_digits),
+                "OR":       round(np.exp(beta), round_digits),
+                "CI_lower": round(np.exp(lo), round_digits),
+                "CI_upper": round(np.exp(hi), round_digits),
+                "p_value":  round(p, round_digits),
+                "cov_type": cov_type
+            })
+
+    result_df = pd.DataFrame(records)
+
+    if not result_df.empty:
+        print(
+            f"  Proportional-odds check: {len(cutpoints)} cutpoint models fit "
+            f"for '{predictor}'. Compare OR across cutpoints per level below "
+            "— roughly constant values support the proportional-odds assumption."
+        )
+
+    return result_df
